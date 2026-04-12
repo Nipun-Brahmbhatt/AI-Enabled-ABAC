@@ -1,0 +1,82 @@
+name: Rego Policy CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  validate-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup OPA
+        uses: open-policy-agent/setup-opa@v2
+        with:
+          version: latest
+
+      - name: Setup Regal
+        run: |
+          curl -L https://github.com/StyraInc/regal/releases/latest/download/regal_Linux_x86_64.tar.gz | tar -xz
+          sudo mv regal /usr/local/bin/
+
+      - name: Regal Lint
+        run: regal lint ./policy
+
+      - name: OPA Test
+        run: opa test ./policy -v
+
+  bundle-and-release:
+    needs: validate-and-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build OPA Bundle
+        run: opa build -b ./policy -o bundle.tar.gz
+
+      - name: Upload Bundle to Artifact Store
+        # Example: Uploading to an S3 bucket or GitHub Releases
+        run: |
+          echo "Uploading bundle.tar.gz to policy store..."
+          # aws s3 cp bundle.tar.gz s3://my-opa-bundles/latest/
+
+      - name: Notify OPAL Server
+        run: |
+          curl -X POST "${{ secrets.OPAL_SERVER_URL }}/webhook" \
+               -H "Content-Type: application/json" \
+               -d '{"topic": "policy_update", "bundle_url": "https://cdn.example.com/bundle.tar.gz"}'
+
+  sync-keycloak-attributes:
+    needs: validate-and-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get Keycloak Access Token
+        id: token
+        run: |
+          TOKEN=$(curl -s -X POST "${{ secrets.KEYCLOAK_URL }}/realms/master/protocol/openid-connect/token" \
+            -d "client_id=admin-cli" \
+            -d "username=${{ secrets.KC_ADMIN }}" \
+            -d "password=${{ secrets.KC_PASS }}" \
+            -d "grant_type=password" | jq -r .access_token)
+          echo "::add-mask::$TOKEN"
+          echo "KC_TOKEN=$TOKEN" >> $GITHUB_ENV
+
+      - name: Push Attributes to Keycloak
+        run: |
+          # Example: Syncing a JSON attribute map to a specific user or group
+          curl -X PUT "${{ secrets.KEYCLOAK_URL }}/admin/realms/${{ secrets.REALM }}/users/${{ secrets.USER_ID }}" \
+               -H "Authorization: Bearer ${{ env.KC_TOKEN }}" \
+               -H "Content-Type: application/json" \
+               -d '{
+                 "attributes": {
+                   "policy_group": ["premium_users"],
+                   "access_level": ["level_4"]
+                 }
+               }'
